@@ -415,6 +415,7 @@ class MiniMaxH3DiT(nn.Module):
         refiner_packed_seq_params,
         use_gradient_checkpointing=False,
         use_gradient_checkpointing_offload=False,
+        gradient_checkpointing_interval=1,
         update_audio_mask=None,
         skip_mask_out_condition=False,
         control_hints=None,
@@ -462,11 +463,18 @@ class MiniMaxH3DiT(nn.Module):
         hidden = decoder_input
         rope_arg = rope_freqs if getattr(self, "vdn_enabled", False) else _prepare_rope_cache(rope_freqs, hidden.dtype)
         cu_arg = packed_seq_params["cu_seqlens_q"].to(device=device, dtype=torch.int32) if getattr(self, "vdn_enabled", False) else cu_seqlens_bounds
+        ckpt_interval = int(gradient_checkpointing_interval) if gradient_checkpointing_interval is not None else 1
         for block_id, block in enumerate(self.blocks):
+            if not use_gradient_checkpointing or ckpt_interval <= 0:
+                ckpt_block = False
+            elif ckpt_interval == 1:
+                ckpt_block = True
+            else:
+                ckpt_block = (block_id % ckpt_interval) != 0
             hidden = gradient_checkpoint_forward(
                 block,
-                use_gradient_checkpointing,
-                use_gradient_checkpointing_offload,
+                ckpt_block,
+                use_gradient_checkpointing_offload and ckpt_block,
                 hidden,
                 t_emb=t_emb,
                 combined_indices=combined_indices,

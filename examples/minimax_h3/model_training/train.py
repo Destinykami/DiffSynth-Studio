@@ -21,6 +21,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         preset_lora_path=None, preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
+        gradient_checkpointing_interval=1,
         extra_inputs=None,
         fp8_models=None,
         offload_models=None,
@@ -65,6 +66,7 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
         self.silent_on_missing_audio = silent_on_missing_audio
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
+        self.gradient_checkpointing_interval = gradient_checkpointing_interval
         self.extra_inputs = extra_inputs.split(",") if extra_inputs is not None else []
         self.fp8_models = fp8_models
         self.task = task
@@ -132,12 +134,21 @@ class MiniMaxH3TrainingModule(DiffusionTrainingModule):
             "rand_device": "cpu",
             "use_gradient_checkpointing": self.use_gradient_checkpointing,
             "use_gradient_checkpointing_offload": self.use_gradient_checkpointing_offload,
+            "gradient_checkpointing_interval": self.gradient_checkpointing_interval,
         }
         inputs_shared = self.parse_extra_inputs(data, self.extra_inputs, inputs_shared)
         return inputs_shared, inputs_posi, inputs_nega
 
     def forward(self, data, inputs=None):
-        if inputs is None: inputs = self.get_pipeline_inputs(data)
+        if inputs is None:
+            inputs = self.get_pipeline_inputs(data)
+        else:
+            inputs_shared, inputs_posi, inputs_nega = inputs
+            inputs_shared = dict(inputs_shared)
+            inputs_shared["use_gradient_checkpointing"] = self.use_gradient_checkpointing
+            inputs_shared["use_gradient_checkpointing_offload"] = self.use_gradient_checkpointing_offload
+            inputs_shared["gradient_checkpointing_interval"] = self.gradient_checkpointing_interval
+            inputs = (inputs_shared, inputs_posi, inputs_nega)
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
@@ -219,6 +230,7 @@ if __name__ == "__main__":
         preset_lora_model=args.preset_lora_model,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
+        gradient_checkpointing_interval=args.gradient_checkpointing_interval,
         extra_inputs=args.extra_inputs,
         fp8_models=args.fp8_models,
         offload_models=args.offload_models,
