@@ -44,13 +44,66 @@ def _norm(size: int, *, eps: float) -> nn.RMSNorm:
     return nn.RMSNorm(size, eps=eps)
 
 
+_HAS_ATEN_FUSED_SWIGLU = (
+    hasattr(torch.ops.aten, "_fused_swiglu_forward")
+    and hasattr(torch.ops.aten, "_fused_swiglu_backward")
+)
+_HAS_TORCH_ROPE = callable(getattr(torch, "rope", None))
+
+
+class _FusedSwiGLUFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor) -> torch.Tensor:
+        x_contig = x if x.is_contiguous() else x.contiguous()
+        ctx.save_for_backward(x_contig)
+        return torch.ops.aten._fused_swiglu_forward(x_contig)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (x_contig,) = ctx.saved_tensors
+        grad_contig = grad_output if grad_output.is_contiguous() else grad_output.contiguous()
+        return torch.ops.aten._fused_swiglu_backward(grad_contig, x_contig)
+
+
+def _swiglu(x: torch.Tensor) -> torch.Tensor:
+    if _HAS_ATEN_FUSED_SWIGLU and x.device.type != "cpu":
+        return _FusedSwiGLUFunction.apply(x)
+    gate, up = x.chunk(2, dim=-1)
+    return nn.functional.silu(gate) * up
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1, x2 = torch.chunk(x, 2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+def _prepare_rope_cache(freqs: torch.Tensor, dtype: torch.dtype):
+    if _HAS_TORCH_ROPE and freqs.device.type != "cpu":
+        return freqs
+    cos = torch.cos(freqs).to(dtype).unsqueeze(1)
+    sin = torch.sin(freqs).to(dtype).unsqueeze(1)
+    return (cos, sin)
+
+
+def _apply_rope(x: torch.Tensor, freqs) -> torch.Tensor:
+    if isinstance(freqs, tuple):
+        cos, sin = freqs
+        rot_dim = cos.shape[-1]
+        x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+        if cos.dtype != x.dtype:
+            cos = cos.to(x.dtype)
+            sin = sin.to(x.dtype)
+        x_rot = (x_rot * cos) + (_rotate_half(x_rot) * sin)
+        return torch.cat((x_rot, x_pass), dim=-1)
     rot_dim = freqs.shape[-1]
+    if _HAS_TORCH_ROPE and x.device.type != "cpu":
+        x_rot = torch.rope(
+            x[..., :rot_dim].unsqueeze(1),
+            freqs,
+            rotary_interleaved=False,
+            batch_first=False,
+        ).squeeze(1)
+        return torch.cat((x_rot, x[..., rot_dim:]), dim=-1)
     x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
     cos = torch.cos(freqs).to(x.dtype).unsqueeze(1)
     sin = torch.sin(freqs).to(x.dtype).unsqueeze(1)
@@ -188,10 +241,7 @@ class MiniMaxH3MLP(nn.Module):
         self.fc2 = nn.Linear(ffn_hidden_size, hidden_size, bias=False)
 
     def forward(self, x):
-        hidden = self.fc1(x)
-        gate, up = hidden.chunk(2, dim=-1)
-        hidden = nn.functional.silu(gate) * up
-        return self.fc2(hidden)
+        return self.fc2(_swiglu(self.fc1(x)))
 
 
 class MiniMaxH3AdalnProj(nn.Module):
@@ -410,6 +460,7 @@ class MiniMaxH3DiT(nn.Module):
         inverse_indices = inverse_indices.to(device)
 
         hidden = decoder_input
+        rope_arg = rope_freqs if getattr(self, "vdn_enabled", False) else _prepare_rope_cache(rope_freqs, hidden.dtype)
         cu_arg = packed_seq_params["cu_seqlens_q"].to(device=device, dtype=torch.int32) if getattr(self, "vdn_enabled", False) else cu_seqlens_bounds
         for block_id, block in enumerate(self.blocks):
             hidden = gradient_checkpoint_forward(
@@ -419,7 +470,7 @@ class MiniMaxH3DiT(nn.Module):
                 hidden,
                 t_emb=t_emb,
                 combined_indices=combined_indices,
-                rope_freqs=rope_freqs,
+                rope_freqs=rope_arg,
                 cu_seqlens=cu_arg,
                 max_seqlen=max_seqlen,
             )
