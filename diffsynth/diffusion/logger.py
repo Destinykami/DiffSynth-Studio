@@ -1,5 +1,7 @@
 import os, torch
+import torch.distributed as dist
 from accelerate import Accelerator
+from accelerate.utils import DistributedType
 
 
 class TensorBoardLogger:
@@ -121,13 +123,76 @@ class ModelLogger:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
         for logger in self.loggers:
             logger.close()
+        accelerator.wait_for_everyone()
+
+    @staticmethod
+    def _gather_fsdp_trainable_state_dict(accelerator: Accelerator, model: torch.nn.Module, save_dtype=torch.bfloat16):
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+        state_dict = {}
+        module_to_clean_prefix = {}
+        for mod_name, mod in model.named_modules():
+            if isinstance(mod, FSDP):
+                clean = mod_name.replace("_fsdp_wrapped_module.", "").replace("_fsdp_wrapped_module", "").strip(".")
+                module_to_clean_prefix[mod] = (clean + ".") if clean else ""
+
+        for fsdp_mod in FSDP.fsdp_modules(model):
+            if not getattr(fsdp_mod, "_has_params", False):
+                continue
+            handle = fsdp_mod._handle
+            flat_param = handle.flat_param
+            if not flat_param.requires_grad or not hasattr(flat_param, "_params"):
+                continue
+            pg = handle.process_group
+            world_size = handle.world_size
+            prefix = module_to_clean_prefix.get(fsdp_mod, "")
+            for param, fqn, shape in zip(flat_param._params, flat_param._fqns, flat_param._shapes):
+                if not param.requires_grad:
+                    continue
+                target_dtype = save_dtype if param.is_floating_point() and save_dtype is not None else param.dtype
+                local_flat = param.detach().to(dtype=target_dtype).contiguous().view(-1)
+                local_n = torch.tensor([local_flat.numel()], dtype=torch.long, device=local_flat.device)
+                sizes = [torch.zeros_like(local_n) for _ in range(world_size)]
+                dist.all_gather(sizes, local_n, group=pg)
+                counts = [int(s.item()) for s in sizes]
+                max_n = max(counts)
+                if max_n == 0:
+                    continue
+                padded = torch.zeros(max_n, dtype=target_dtype, device=local_flat.device)
+                if local_flat.numel() > 0:
+                    padded[: local_flat.numel()].copy_(local_flat)
+                gathered = [torch.empty(max_n, dtype=target_dtype, device=local_flat.device) for _ in range(world_size)]
+                dist.all_gather(gathered, padded, group=pg)
+                if accelerator.is_main_process:
+                    pieces = [g[:c] for g, c in zip(gathered, counts) if c > 0]
+                    full_tensor = torch.cat(pieces, dim=0)[: shape.numel()].view(shape).cpu()
+                    state_dict[f"{prefix}{fqn}"] = full_tensor
+                del padded, gathered
+        return state_dict
 
     def save_model(self, accelerator: Accelerator, model: torch.nn.Module, file_name):
         accelerator.wait_for_everyone()
+        unwrapped = accelerator.unwrap_model(model)
+        if accelerator.distributed_type == DistributedType.FSDP and not getattr(accelerator, "is_fsdp2", False):
+            save_dtype = getattr(getattr(unwrapped, "pipe", None), "torch_dtype", torch.bfloat16)
+            state_dict = self._gather_fsdp_trainable_state_dict(accelerator, model, save_dtype=save_dtype)
+            if accelerator.is_main_process:
+                if self.remove_prefix_in_ckpt is not None:
+                    state_dict = {
+                        (k[len(self.remove_prefix_in_ckpt):] if k.startswith(self.remove_prefix_in_ckpt) else k): v
+                        for k, v in state_dict.items()
+                    }
+                state_dict = self.state_dict_converter(state_dict)
+                os.makedirs(self.output_path, exist_ok=True)
+                path = os.path.join(self.output_path, file_name)
+                accelerator.save(state_dict, path, safe_serialization=True)
+            accelerator.wait_for_everyone()
+            return
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
-            state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = unwrapped.export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+        accelerator.wait_for_everyone()

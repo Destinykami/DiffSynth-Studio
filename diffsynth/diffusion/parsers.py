@@ -43,6 +43,7 @@ def add_training_config(parser: argparse.ArgumentParser):
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     parser.add_argument("--task", type=str, default="sft", required=False, help="Task type.")
     parser.add_argument("--customized_optimizer", type=str, default=None, help="Customized optimizer, e.g., `bitsandbytes.optim.Adam8bit` and `torch.optim.Adam`. The default optimizer is `torch.optim.AdamW`.")
+    parser.add_argument("--optimizer_kwargs", type=str, default=None, help="Optional JSON object of extra keyword arguments forwarded to the optimizer constructor (e.g. '{\"foreach\": true}').")
     return parser
 
 def add_output_config(parser: argparse.ArgumentParser):
