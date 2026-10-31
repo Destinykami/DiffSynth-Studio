@@ -67,9 +67,40 @@ def _modulate_gate(x, gate, other, indices):
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
-def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale):
+def _resolve_cu_seqlens_bounds(cu_seqlens):
+    if isinstance(cu_seqlens, (tuple, list)):
+        return tuple(int(v) for v in cu_seqlens)
+    return tuple(int(v) for v in cu_seqlens.tolist())
+
+
+def _sdpa_varlen_attention(q, k, v, cu_seqlens, softmax_scale, active_seqlen=None):
+    bounds = _resolve_cu_seqlens_bounds(cu_seqlens)
+    total = q.shape[0]
+    if (
+        active_seqlen is not None
+        and len(bounds) == 3
+        and bounds[0] == 0
+        and bounds[1] == active_seqlen
+        and bounds[2] == total
+    ):
+        # Packed H3 layout is [0, used, aligned_seq_len], where [used:aligned_seq_len] is inert
+        # alignment padding whose outputs are discarded by the final index_select. Skip running
+        # SDPA on the trailing padding segment.
+        if active_seqlen == total:
+            seg_q = q.transpose(0, 1).unsqueeze(0)
+            seg_k = k.transpose(0, 1).unsqueeze(0)
+            seg_v = v.transpose(0, 1).unsqueeze(0)
+            return attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale).squeeze(0).transpose(0, 1)
+        out = q.new_zeros(q.shape)
+        if active_seqlen > 0:
+            seg_q = q[:active_seqlen].transpose(0, 1).unsqueeze(0)
+            seg_k = k[:active_seqlen].transpose(0, 1).unsqueeze(0)
+            seg_v = v[:active_seqlen].transpose(0, 1).unsqueeze(0)
+            seg_out = attention_forward(seg_q, seg_k, seg_v, scale=softmax_scale)
+            out[:active_seqlen] = seg_out.squeeze(0).transpose(0, 1)
+        return out
+
     out = torch.empty_like(q)
-    bounds = cu_seqlens.tolist()
     for start, stop in zip(bounds[:-1], bounds[1:]):
         if stop == start:
             continue
@@ -145,7 +176,7 @@ class MiniMaxH3Attention(nn.Module):
         if rope_freqs is not None:
             q = _apply_rope(q, rope_freqs)
             k = _apply_rope(k, rope_freqs)
-        out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale)
+        out = _sdpa_varlen_attention(q, k, v, cu_seqlens=cu_seqlens, softmax_scale=self.softmax_scale, active_seqlen=max_seqlen)
         out = out.reshape(total, self.num_heads * self.head_dim)
         return self.out_proj(out)
 
@@ -347,9 +378,17 @@ class MiniMaxH3DiT(nn.Module):
         text_pos = text_pos_info["position_ids"].view(-1).to(torch.long)
         infer_out_pos = img_pos_for_infer_output_info["position_ids"].view(-1).to(torch.long)
 
-        cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
+        cu_seqlens_bounds = packed_seq_params.get("cu_seqlens_bounds")
+        if cu_seqlens_bounds is None:
+            cu_seqlens_bounds = _resolve_cu_seqlens_bounds(packed_seq_params["cu_seqlens_q"])
+        else:
+            cu_seqlens_bounds = tuple(int(v) for v in cu_seqlens_bounds)
         max_seqlen = int(packed_seq_params["max_seqlen_q"])
-        refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
+        refiner_cu_bounds = refiner_packed_seq_params.get("cu_seqlens_bounds")
+        if refiner_cu_bounds is None:
+            refiner_cu_bounds = _resolve_cu_seqlens_bounds(refiner_packed_seq_params["cu_seqlens_q"])
+        else:
+            refiner_cu_bounds = tuple(int(v) for v in refiner_cu_bounds)
         refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
 
         if x.dim() != 3 or x.shape[0] != 1:
@@ -363,7 +402,7 @@ class MiniMaxH3DiT(nn.Module):
             x=x, audio_x=audio_x, text_embeddings_selected=text_selected,
             unique_timesteps=unique_timesteps.view(-1).to(device),
             img_pos=img_pos.to(device), audio_pos=audio_pos.to(device), text_pos=text_pos.to(device),
-            refiner_cu_seqlens=refiner_cu.to(device), refiner_max_seqlen=refiner_max,
+            refiner_cu_seqlens=refiner_cu_bounds, refiner_max_seqlen=refiner_max,
             seq_len=seq_len, device=device,
         )
 
@@ -371,7 +410,7 @@ class MiniMaxH3DiT(nn.Module):
         inverse_indices = inverse_indices.to(device)
 
         hidden = decoder_input
-        cu_seqlens = cu_seqlens.to(device)
+        cu_arg = packed_seq_params["cu_seqlens_q"].to(device=device, dtype=torch.int32) if getattr(self, "vdn_enabled", False) else cu_seqlens_bounds
         for block_id, block in enumerate(self.blocks):
             hidden = gradient_checkpoint_forward(
                 block,
@@ -381,7 +420,7 @@ class MiniMaxH3DiT(nn.Module):
                 t_emb=t_emb,
                 combined_indices=combined_indices,
                 rope_freqs=rope_freqs,
-                cu_seqlens=cu_seqlens,
+                cu_seqlens=cu_arg,
                 max_seqlen=max_seqlen,
             )
             if control_hints is not None and block_id in control_hints:

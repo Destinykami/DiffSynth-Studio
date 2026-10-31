@@ -705,7 +705,9 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         return {
             "img_pos": img_pos, "audio_pos": audio_pos, "text_pos": torch.arange(0, text_len),
             "img_position_ids": g[None], "token_tags": token_tags,
-            "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32), "seq_len": seq_len,
+            "cu_seqlens": torch.tensor([0, used, seq_len], dtype=torch.int32),
+            "cu_seqlens_bounds": (0, int(used), int(seq_len)),
+            "seq_len": seq_len,
         }
 
     def _build_packed_ref2va(self, text_len, latent_t, latent_h, latent_w, audio_t, ref_blocks, audio_channel=2):
@@ -832,6 +834,7 @@ class MiniMaxH3Unit_PackedSequenceBuilder(PipelineUnit):
         return {
             "img_pos": img_pos, "audio_pos": audio_pos, "text_pos": text_pos,
             "img_position_ids": g[None], "token_tags": token_tags, "cu_seqlens": cu,
+            "cu_seqlens_bounds": (0, int(used), int(seq_len)),
             "seq_len": seq_len,
         }
 
@@ -912,9 +915,13 @@ def model_fn_minimax_h3_controlnet(
     audio_pos = audio_pos_info["position_ids"].view(-1).to(torch.long)
     text_pos = text_pos_info["position_ids"].view(-1).to(torch.long)
 
-    cu_seqlens = packed_seq_params["cu_seqlens_q"].to(torch.int32)
+    cu_seqlens_bounds = packed_seq_params.get("cu_seqlens_bounds")
+    if cu_seqlens_bounds is None:
+        cu_seqlens_bounds = tuple(int(v) for v in packed_seq_params["cu_seqlens_q"].tolist())
     max_seqlen = int(packed_seq_params["max_seqlen_q"])
-    refiner_cu = refiner_packed_seq_params["cu_seqlens_q"].to(torch.int32)
+    refiner_cu_bounds = refiner_packed_seq_params.get("cu_seqlens_bounds")
+    if refiner_cu_bounds is None:
+        refiner_cu_bounds = tuple(int(v) for v in refiner_packed_seq_params["cu_seqlens_q"].tolist())
     refiner_max = int(refiner_packed_seq_params["max_seqlen_q"])
 
     if x.dim() != 3 or x.shape[0] != 1:
@@ -928,14 +935,13 @@ def model_fn_minimax_h3_controlnet(
         x=x, audio_x=audio_x, text_embeddings_selected=text_selected,
         unique_timesteps=unique_timesteps.view(-1).to(device),
         img_pos=img_pos.to(device), audio_pos=audio_pos.to(device), text_pos=text_pos.to(device),
-        refiner_cu_seqlens=refiner_cu.to(device), refiner_max_seqlen=refiner_max,
+        refiner_cu_seqlens=refiner_cu_bounds, refiner_max_seqlen=refiner_max,
         seq_len=seq_len, device=device,
     )
 
     combined_indices = (inverse_indices * 3 + token_tags.clamp(min=0)).to(device)
     inverse_indices = inverse_indices.to(device)
 
-    cu_seqlens = cu_seqlens.to(device)
     control_hints = controlnet(
         decoder_input,
         control_rows,
@@ -944,7 +950,7 @@ def model_fn_minimax_h3_controlnet(
         t_emb=t_emb,
         combined_indices=combined_indices,
         rope_freqs=rope_freqs,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=cu_seqlens_bounds,
         max_seqlen=max_seqlen,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
@@ -993,7 +999,14 @@ def model_fn_minimax_h3(
     audio_rows = pack_audio(audio_latents)
 
     img_pos, audio_pos, text_pos = packed["img_pos"], packed["audio_pos"], packed["text_pos"]
-    cu, seq_len, text_len = packed["cu_seqlens"], packed["seq_len"], text_pos.shape[0]
+    cu, seq_len, text_len = packed["cu_seqlens"], int(packed["seq_len"]), int(text_pos.shape[0])
+    cu_bounds = packed.get("cu_seqlens_bounds")
+    if cu_bounds is None:
+        cu_bounds = tuple(int(v) for v in cu.tolist())
+    else:
+        cu_bounds = tuple(int(v) for v in cu_bounds)
+    max_seqlen_q = cu_bounds[1]
+    refiner_bounds = (0, text_len, text_len)
     # Video Sequence
     cond_anchor = ref_visual_anchor if ref_visual_anchor is not None else keyframe_cond_anchor
     cond_rows_count = 0 if cond_anchor is None else cond_anchor.shape[0]
@@ -1020,7 +1033,9 @@ def model_fn_minimax_h3(
     timesteps[audio_pos[:ref_audio_rows_count]] = max(t_audio, audio_cond_noise_aug)
     unique_timesteps, inverse_indices = torch.unique(timesteps, sorted=True, return_inverse=True)
 
-    refiner_cu = torch.tensor([0, text_len, text_len], dtype=torch.int32, device=device)
+    refiner_cu = torch.tensor(refiner_bounds, dtype=torch.int32, device=device)
+    packed_seq_params = {"cu_seqlens_q": cu, "cu_seqlens_bounds": cu_bounds, "max_seqlen_q": max_seqlen_q}
+    refiner_packed_seq_params = {"cu_seqlens_q": refiner_cu, "cu_seqlens_bounds": refiner_bounds, "max_seqlen_q": text_len}
 
     # ControlNet
     if control_rows is not None:
@@ -1036,8 +1051,8 @@ def model_fn_minimax_h3(
             {"position_ids": img_pos},
             {"position_ids": audio_pos},
             {"position_ids": text_pos},
-            {"cu_seqlens_q": cu, "max_seqlen_q": int(cu[1])},
-            {"cu_seqlens_q": refiner_cu, "max_seqlen_q": text_len},
+            packed_seq_params,
+            refiner_packed_seq_params,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
             controlnet=controlnet,
@@ -1062,8 +1077,8 @@ def model_fn_minimax_h3(
         audio_pos_info={"position_ids": audio_pos},
         text_pos_info={"position_ids": text_pos},
         img_pos_for_infer_output_info={"position_ids": img_pos},
-        packed_seq_params={"cu_seqlens_q": cu, "max_seqlen_q": int(cu[1])},
-        refiner_packed_seq_params={"cu_seqlens_q": refiner_cu, "max_seqlen_q": text_len},
+        packed_seq_params=packed_seq_params,
+        refiner_packed_seq_params=refiner_packed_seq_params,
         update_mask=None,
         skip_mask_out_condition=True,
         use_gradient_checkpointing=use_gradient_checkpointing,
