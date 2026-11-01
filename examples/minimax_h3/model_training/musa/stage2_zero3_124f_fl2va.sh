@@ -1,13 +1,13 @@
 #!/bin/bash
 # Stage 2: Optimized 8-GPU DeepSpeed ZeRO-3 LoRA training for MiniMax-H3 on MUSA (124 frames FL2VA full-length).
 # Measured on 8 x MTT S5000 (80 GB):
-#   First step: 19.96 s | Steady-state: 15.32 s/it (min 15.04 s) | Peak VRAM: 49.6 GiB
+#   First step: 19.77 s | Steady-state: 14.75 s/it (min 14.55 s) | Peak VRAM: 48.3 GiB
 #
 # Key optimizations applied:
 # 1. Unsets PYTORCH_MUSA_ALLOC_CONF=expandable_segments:True (eliminates virtual-memory remap thrashing under ZeRO-3).
 # 2. Disables redundant --use_gradient_checkpointing_offload and --find_unused_parameters.
-# 3. Uses selective activation checkpointing (--gradient_checkpointing_interval 9, keeping 6/50 blocks in VRAM with zero allocator flushes).
-# 4. Uses torch_musa.optim.FusedAdamW + MUSA native fused SwiGLU, torch.rope, host cu_seqlens bounds, and padding SDPA skip.
+# 3. Uses selective activation checkpointing (--gradient_checkpointing_interval 7, keeping 8/50 blocks in VRAM with zero allocator flushes).
+# 4. Uses torch_musa.optim.FusedAdamW + MUSA native fused SwiGLU, torch.rope, Triton AdaLN, contiguous QKV unbind, and padding SDPA skip.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,7 @@ DATASET_REPEAT="${DATASET_REPEAT:-48}"
 NUM_EPOCHS="${NUM_EPOCHS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 LORA_RANK="${LORA_RANK:-32}"
-CKPT_INTERVAL="${CKPT_INTERVAL:-9}"
+CKPT_INTERVAL="${CKPT_INTERVAL:-7}"
 
 accelerate launch --config_file "${SCRIPT_DIR}/accelerate_config_zero3_8gpu.yaml" \
   "${SCRIPT_DIR}/train_musa.py" \

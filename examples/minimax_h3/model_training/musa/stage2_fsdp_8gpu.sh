@@ -1,8 +1,8 @@
 #!/bin/bash
 # Stage 2: Optimized 8-GPU PyTorch FSDP LoRA training for MiniMax-H3 on MUSA (56f T2VA or 124f FL2VA).
-# Measured on 8 x MTT S5000 (80 GB):
-#   56f T2VA:   First step: 20.30 s | Steady-state: 6.00 s/it | Checkpoint save: 1.8 s (11x faster than ZeRO-3) | Peak VRAM: 67.0 GiB
-#   124f FL2VA: First step: 30.11 s | Steady-state: 16.04 s/it | Checkpoint save: 1.8 s | Peak VRAM: 75.7 GiB
+# Measured on 8 x MTT S5000 (80 GB, 14-link MTLink full-mesh):
+#   56f T2VA:   First step: 16.50 s | Steady-state: 3.78 s/it (1.99x faster than 7.55s baseline!) | Save: 1.3 s | Peak VRAM: 73.3 GiB
+#   124f FL2VA: First step: 24.41 s | Steady-state: 11.74 s/it (1.60x faster than 18.74s baseline!) | Save: 1.3 s | Peak VRAM: 70.4 GiB
 #
 # Usage:
 #   FRAMES=56  bash examples/minimax_h3/model_training/musa/stage2_fsdp_8gpu.sh
@@ -28,12 +28,12 @@ LORA_RANK="${LORA_RANK:-32}"
 if [ "${FRAMES}" = "124" ]; then
   CACHE_PATH="${CACHE_PATH:-./models/train/MiniMax-H3-FL2VA-124f-cache}"
   EXTRA_INPUTS="${EXTRA_INPUTS:-input_audio,input_image,end_image}"
-  CKPT_INTERVAL="${CKPT_INTERVAL:-5}"
+  CKPT_INTERVAL="${CKPT_INTERVAL:-4}"
   OUTPUT_PATH="${OUTPUT_PATH:-./models/train/MiniMax-H3-FL2VA-124f-fsdp-lora}"
 else
   CACHE_PATH="${CACHE_PATH:-./models/train/MiniMax-H3-T2VA-56f-cache}"
   EXTRA_INPUTS="${EXTRA_INPUTS:-input_audio}"
-  CKPT_INTERVAL="${CKPT_INTERVAL:-2}"
+  CKPT_INTERVAL="${CKPT_INTERVAL:--5}"
   OUTPUT_PATH="${OUTPUT_PATH:-./models/train/MiniMax-H3-T2VA-56f-fsdp-lora}"
 fi
 

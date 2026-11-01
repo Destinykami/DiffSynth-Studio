@@ -1,7 +1,7 @@
 #!/bin/bash
 # Stage 2: Optimized 8-GPU DeepSpeed ZeRO-3 LoRA training for MiniMax-H3 on MUSA (56 frames T2VA).
 # Measured on 8 x MTT S5000 (80 GB):
-#   First step: 9.38 s | Steady-state: 5.65 s/it (min 5.48 s) | Peak VRAM: 58.7 GiB
+#   First step: 9.85 s | Steady-state: 5.44 s/it (min 5.22 s) | Peak VRAM: 51.6 GiB
 #
 # Key optimizations applied:
 # 1. Unsets PYTORCH_MUSA_ALLOC_CONF=expandable_segments:True (eliminates virtual-memory remap thrashing under ZeRO-3).

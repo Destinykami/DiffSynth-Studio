@@ -132,18 +132,56 @@ def install_fsdp_bf16_preservation() -> None:
         return
     import accelerate
     import torch
+    import torch.distributed as dist
     from accelerate.utils import DistributedType
 
     orig_prepare_model = accelerate.Accelerator.prepare_model
+    orig_backward = accelerate.Accelerator.backward
+    separate_lora = os.environ.get("FSDP_SEPARATE_LORA", "1") == "1"
 
     def prepare_model(self, model, evaluation_mode=False, device_placement=None):
         if self.distributed_type == DistributedType.FSDP and not getattr(self, "is_fsdp2", False):
+            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
             fsdp_plugin = self.state.fsdp_plugin
             if getattr(fsdp_plugin, "limit_all_gathers", None) is False:
                 fsdp_plugin.limit_all_gathers = True
             saved_mp = self.mixed_precision
+            if separate_lora:
+                # Exclude all LoRA sub-modules (lora_A / lora_B ModuleDicts) from FSDP FlatParameters:
+                # 1. Frozen 33B base FlatParameters have requires_grad=False, so FSDP skips allocating
+                #    1.3 GB unsharded grad buffers per block and skips 50 x 1.3 GB (65 GB/step) reduce_scatters!
+                # 2. Replicated LoRA parameters (~310 MB) are kept in fp32 for full master-weight precision
+                #    and synchronized across ranks before training and via a single bucketed all_reduce after backward.
+                lora_modules = [
+                    mod
+                    for name, mod in model.named_modules()
+                    if name.endswith(".lora_A") or name.endswith(".lora_B")
+                ]
+                trainable_params = [p for p in model.parameters() if p.requires_grad]
+                if lora_modules and trainable_params:
+                    with torch.no_grad():
+                        for p in trainable_params:
+                            if p.device.type == "cpu":
+                                p.data = p.data.to(self.device)
+                            if p.dtype != torch.float32:
+                                p.data = p.data.to(torch.float32)
+                            if dist.is_initialized() and dist.get_world_size() > 1:
+                                dist.broadcast(p.data, src=0)
+                    fsdp_plugin.ignored_modules = lora_modules
+                    self._fsdp_replicated_lora_params = trainable_params
+                    if os.environ.get("DIFFSYNTH_FUSED_LORA_LINEAR", "1") == "1":
+                        from diffsynth.diffusion.training_module import _install_fused_peft_lora_linear
+
+                        _install_fused_peft_lora_linear(model)
+                    if self.is_main_process:
+                        total_mb = sum(p.numel() * p.element_size() for p in trainable_params) / (1024**2)
+                        print(
+                            f"[train_musa] Excluded {len(lora_modules)} LoRA modules ({len(trainable_params)} fp32 tensors, "
+                            f"{total_mb:.1f} MiB) from FSDP FlatParameters (eliminated 65 GB/step frozen grad reduce_scatter).",
+                            flush=True,
+                        )
             model = orig_prepare_model(self, model, evaluation_mode=evaluation_mode, device_placement=device_placement)
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
             reverted = 0
             for fsdp_mod in FSDP.fsdp_modules(model):
@@ -162,7 +200,22 @@ def install_fsdp_bf16_preservation() -> None:
             return model
         return orig_prepare_model(self, model, evaluation_mode=evaluation_mode, device_placement=device_placement)
 
+    def backward(self, loss, **kwargs):
+        orig_backward(self, loss, **kwargs)
+        replicated_lora = getattr(self, "_fsdp_replicated_lora_params", None)
+        if replicated_lora and self.sync_gradients and dist.is_initialized() and dist.get_world_size() > 1:
+            grads = [p.grad for p in replicated_lora if p.grad is not None]
+            if grads:
+                flat_grad = torch.cat([g.reshape(-1) for g in grads])
+                dist.all_reduce(flat_grad, op=dist.ReduceOp.AVG)
+                offset = 0
+                for g in grads:
+                    numel = g.numel()
+                    g.copy_(flat_grad[offset : offset + numel].view_as(g))
+                    offset += numel
+
     accelerate.Accelerator.prepare_model = prepare_model
+    accelerate.Accelerator.backward = backward
 
 
 def install_lifecycle_and_telemetry() -> None:
