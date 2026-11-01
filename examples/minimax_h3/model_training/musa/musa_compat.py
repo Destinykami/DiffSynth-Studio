@@ -1,12 +1,14 @@
-"""Device-placement fixes on top of torchada for DiffSynth's VRAM offload on MUSA.
+"""Device-placement and operator fixes on top of torchada for DiffSynth on MUSA.
 
-DiffSynth keeps parameters on CPU (`offload_device="cpu"`) and moves a module onto the
-accelerator inside its VRAM layer wrapper. Qwen3-VL's vision tower is partly offloaded, so
-`pos_embed` weight and the text hidden states can end up on different devices.
-
-Two fixes:
-1. `Qwen3VLVisionModel.forward` syncs the whole vision tower onto the input device once.
+Fixes:
+1. `Qwen3VLVisionModel.forward` syncs the whole vision tower onto the input device once under VRAM offload.
 2. `F.embedding` / `F.linear` keep operands on one device, preferring the accelerator.
+3. `mate.mha_interface.FlashAttnVarlenFunc.backward`: fixes `flash_attention_3` non-varlen 4D
+   (`cu_seqlens_q=None`) backward crash (`ValueError: too many values to unpack (expected 2)`).
+   In `flash_attn_3.interface.flash_attn_func`, 4D `[B, S, H, D]` inputs are forwarded to
+   `mate_flash_attn_varlen_func(..., cu_seqlens_q=None)`, where `mubin` forward already produces
+   3D padded `softmax_lse` of shape `[B, H, S]`, but `backward` unconditionally called
+   `lse_varlen_to_padded` expecting 2D `[H, total_Q]` and `cu_seqlens_q != None`.
 """
 import logging
 
@@ -16,7 +18,7 @@ import torch.nn.functional as F
 log = logging.getLogger("musa_compat")
 
 _orig_embedding = F.embedding
-_stats = {"embedding": 0, "vision": 0}
+_stats = {"embedding": 0, "vision": 0, "mate_fa3_bwd": 0}
 
 _orig_linear = F.linear
 _stats_linear = {"moved": 0}
@@ -72,8 +74,63 @@ def _patch_qwen3vl_vision():
     cls.forward = forward
 
 
+def _patch_mate_fa3_4d_backward():
+    try:
+        import mate.mha_interface as mha
+    except Exception:
+        return
+    if getattr(mha.FlashAttnVarlenFunc, "_musa_4d_bwd_patched", False):
+        return
+    orig_bwd = mha.FlashAttnVarlenFunc.backward
+
+    def backward(ctx, dout, *args):
+        q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k = ctx.saved_tensors
+        if cu_seqlens_q is None and q.dim() == 4 and softmax_lse.dim() == 3:
+            _stats["mate_fa3_bwd"] += 1
+            b, sq, hq, d = q.shape
+            _, sk, hk, dv = v.shape
+            cu_q = torch.arange(0, (b + 1) * sq, step=sq, dtype=torch.int32, device=q.device)
+            cu_k = torch.arange(0, (b + 1) * sk, step=sk, dtype=torch.int32, device=k.device)
+            dq = torch.empty((b * sq, hq, d), dtype=q.dtype, device=q.device)
+            dk = torch.empty((b * sk, hk, d), dtype=k.dtype, device=k.device)
+            dv_t = torch.empty((b * sk, hk, dv), dtype=v.dtype, device=v.device)
+            dout_flat = dout.reshape(b * sq, hq, dv)
+            if d % 8 != 0:
+                dout_flat = F.pad(dout_flat, [0, 8 - d % 8])
+            mha._flash_attn_varlen_backward(
+                dout_flat,
+                q.reshape(b * sq, hq, d),
+                k.reshape(b * sk, hk, d),
+                v.reshape(b * sk, hk, dv),
+                out.reshape(b * sq, hq, dv),
+                softmax_lse.contiguous(),
+                dq,
+                dk,
+                dv_t,
+                cu_q,
+                cu_k,
+                sq,
+                sk,
+                dropout_p=0.0,
+                softmax_scale=ctx.softmax_scale,
+                causal=ctx.causal,
+                window_size_left=ctx.window_size[0],
+                window_size_right=ctx.window_size[1],
+                softcap=ctx.softcap,
+                alibi_slopes=None,
+                deterministic=ctx.deterministic,
+                rng_state=None,
+            )
+            return (dq.view_as(q), dk.view_as(k), dv_t.view_as(v)) + (None,) * 28
+        return orig_bwd(ctx, dout, *args)
+
+    mha.FlashAttnVarlenFunc.backward = staticmethod(backward)
+    mha.FlashAttnVarlenFunc._musa_4d_bwd_patched = True
+
+
 def apply():
     F.embedding = _embedding
     F.linear = _linear
     _patch_qwen3vl_vision()
+    _patch_mate_fa3_4d_backward()
     return _stats

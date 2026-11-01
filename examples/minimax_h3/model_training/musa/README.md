@@ -22,7 +22,7 @@
 examples/minimax_h3/model_training/musa/
 ├── README.md                          # 本文档：快速启动 + 两轮优化原理 + 消融实验数据
 ├── train_musa.py                      # MUSA 训练入口包装器（torchada / FSDP 冻结基座与 LoRA 分离 / bf16 分片 / 步级计时）
-├── musa_compat.py                     # Qwen3-VL 视觉塔与 F.embedding 设备对齐补丁
+├── musa_compat.py                     # Qwen3-VL 视觉塔对齐 + mate flash_attention_3 4D backward 修复补丁
 ├── accelerate_config_fsdp_8gpu.yaml   # 8 卡 PyTorch FSDP 配置（推荐首选：最快训练 + 1.3s 保存）
 ├── accelerate_config_zero3_8gpu.yaml  # 8 卡 DeepSpeed ZeRO-3 配置
 ├── stage1_data_process.sh             # 阶段一：数据预处理（支持单卡或 8 卡数据并行）
@@ -125,6 +125,13 @@ FRAMES=124 bash examples/minimax_h3/model_training/musa/stage2_full_zero3_8gpu.s
 
 ### 3.7 关闭 ZeRO-3 下的 `PYTORCH_MUSA_ALLOC_CONF=expandable_segments:True`
 - **避坑结论**：在 DeepSpeed ZeRO-3 下开启 `expandable_segments:True` 会与 ZeRO-3 每层动态申请/释放参数缓冲的模式冲突，触发 MUSA 虚拟页重映射与 `allocator cache flushes`（使 124 帧稳态从 `14.75 s/it` 劣化至 `38.36 s/it`）。所有 ZeRO-3 脚本均已显式 `unset PYTORCH_MUSA_ALLOC_CONF`。
+
+### 3.8 修复 `mate` 库 `flash_attention_3` 4D 非 varlen 反向崩溃（`musa_compat._patch_mate_fa3_4d_backward`）
+- **根因澄清**：
+  - 早期记录曾认为 `mate` 的 varlen 反向整体损坏。经源码核查发现：**真正的 3D `flash_attn_varlen_func(cu_seqlens_q != None)` 在 `mate` 中前向与反向均完全正常**（`mubin` 后端产出 2D `softmax_lse [H, total_Q]`，`lse_varlen_to_padded` 正常转为 3D `[B, H, max_Q]`）。
+  - 报错只发生在 **4D 非 varlen 接口 `flash_attn_interface.flash_attn_func(q, k, v)`**（DiffSynth 的 `attention_forward` 所调入口）：`flash_attn_3/interface.py:72` 将 4D `[B, S, H, D]` 透传给 `mate_flash_attn_varlen_func(..., cu_seqlens_q=None)`；`FlashAttnVarlenFunc.forward` 的 `else` 分支（`is_varlen=False`）已直接产出 **3D** `softmax_lse [B, H, S]`，但 `FlashAttnVarlenFunc.backward` 漏写了 `cu_seqlens_q is None` 分支，无条件调用只接受 2D 输入的 `lse_varlen_to_padded(softmax_lse, None, None)`，导致 `H, total_Q = lse_flat.shape` 抛出 `ValueError: too many values to unpack (expected 2)`。
+- **补丁修复**：
+  - 在 `musa_compat.py` 中对 `FlashAttnVarlenFunc.backward` 增加 `cu_seqlens_q is None and q.dim() == 4` 分支处理（直接复用 3D `softmax_lse` 并构造等长 `cu_seqlens` 调用 `_flash_attn_varlen_backward`）。修复后 `DIFFSYNTH_ATTENTION_IMPLEMENTATION=flash_attention_3` 在训练反向中 100% 通过，与 `flash_attention_2` / `torch`（SDPA）数值一致且速度相同（8 卡 FSDP 56 帧稳态同为 `3.78 s/it`）。
 
 ---
 
