@@ -9,7 +9,8 @@
 | 训练场景 | 初始基线（ZeRO-3） | 第一轮优化后 | **第二轮深度优化后（当前）** | **累计提速 / 关键突破** |
 |---|---|---|---|---|
 | **56 帧 T2VA（Stage 2）** | 稳态 `7.55 s/it`（均 `7.99s`），保存 `20.9s` | ZeRO-3 `5.65 s/it` / FSDP `6.00 s/it` | **FSDP 稳态 `3.78 s/it`（均 `5.90s`，保存 `1.3s`）**<br>ZeRO-3 稳态 `5.44 s/it`（最快 `5.22s`） | **稳态提速 2.00×（`7.55s → 3.78s`）**，保存提速 **16×** |
-| **124 帧 FL2VA 全长首尾帧+音频（Stage 2）** | 稳态 `18.74 s/it`（均 `19.74s`），保存 `20.4s` | ZeRO-3 `15.32 s/it` / FSDP `16.04 s/it` | **FSDP 稳态 `11.74 s/it`（均 `13.85s`，保存 `1.3s`）**<br>ZeRO-3 稳态 `14.75 s/it`（最快 `14.55s`） | **稳态提速 1.60×（`18.74s → 11.74s`）**，保存提速 **15.7×** |
+| **124 帧 FL2VA 全长首尾帧+音频（Stage 2 LoRA）** | 稳态 `18.74 s/it`（均 `19.74s`），保存 `20.4s` | ZeRO-3 `15.32 s/it` / FSDP `16.04 s/it` | **FSDP 稳态 `11.74 s/it`（均 `13.85s`，保存 `1.3s`）**<br>ZeRO-3 稳态 `14.75 s/it`（最快 `14.55s`） | **稳态提速 1.60×（`18.74s → 11.74s`）**，保存提速 **15.7×** |
+| **33B 全参数微调（Full-Param SFT，535 张量）** | 124 帧 ZeRO-3 直接 OOM（需开 CPU offload `51.43 s/it`） | — | **8 卡 FSDP 纯显存内全参训练：**<br>• **56 帧 T2VA 稳态 `9.21 s/it`**（保存 62 GiB `58.4s`）<br>• **124 帧 FL2VA 稳态 `17.85 s/it`**（保存 62 GiB `58.6s`） | **8 卡 80 GB 免 CPU Offload 跑通 33B 全参 SFT**（124 帧比 ZeRO-3 CPU Offload **快 2.88×**） |
 | **124 帧 FL2VA 数据预处理（Stage 1）** | 单卡 `20.8 s/样本`（不含加载） | 8 卡 DP `6.64 s/样本`（稳态 `~2.25 s/样本`） | **8 卡 DP 稳态 `~2.25 s/样本`** | 稳态吞吐提升 **~9.2×** |
 | **50 层 `MiniMaxH3DiTBlock + LoRA` 单卡纯算力** | 56f `4.77 s` / 124f `12.30 s`（全检查点） | 56f `4.34 s` / 124f `11.49 s` | **56f `3.69 s`（无检查点 `2.64 s`）**<br>**124f `10.05 s`（无检查点 `7.29 s`）** | 单层算子耗时再降 **15%–20%**，单层保存激活降 **27%** |
 
@@ -25,9 +26,11 @@ examples/minimax_h3/model_training/musa/
 ├── accelerate_config_fsdp_8gpu.yaml   # 8 卡 PyTorch FSDP 配置（推荐首选：最快训练 + 1.3s 保存）
 ├── accelerate_config_zero3_8gpu.yaml  # 8 卡 DeepSpeed ZeRO-3 配置
 ├── stage1_data_process.sh             # 阶段一：数据预处理（支持单卡或 8 卡数据并行）
-├── stage2_fsdp_8gpu.sh                # ★ 阶段二首选：8 卡 FSDP（56 帧稳态 3.78 s/it，124 帧稳态 11.74 s/it，保存 1.3 s）
-├── stage2_zero3_56f_t2va.sh           # 阶段二：8 卡 ZeRO-3 56 帧 T2VA 训练（稳态 5.44 s/it）
-└── stage2_zero3_124f_fl2va.sh         # 阶段二：8 卡 ZeRO-3 124 帧 FL2VA 全长首尾帧训练（稳态 14.75 s/it）
+├── stage2_fsdp_8gpu.sh                # ★ 阶段二 LoRA 首选：8 卡 FSDP（56 帧稳态 3.78 s/it，124 帧稳态 11.74 s/it，保存 1.3 s）
+├── stage2_zero3_56f_t2va.sh           # 阶段二 LoRA：8 卡 ZeRO-3 56 帧 T2VA 训练（稳态 5.44 s/it）
+├── stage2_zero3_124f_fl2va.sh         # 阶段二 LoRA：8 卡 ZeRO-3 124 帧 FL2VA 全长首尾帧训练（稳态 14.75 s/it）
+├── stage2_full_fsdp_8gpu.sh           # ★ 阶段二 33B 全参 SFT 首选：8 卡 FSDP（56 帧 9.21 s/it，124 帧 17.85 s/it，免 CPU offload）
+└── stage2_full_zero3_8gpu.sh          # 阶段二 33B 全参 SFT：8 卡 ZeRO-3（56 帧 11.04 s/it；124 帧需 CPU offload 51.43 s/it）
 ```
 
 ---
@@ -64,6 +67,18 @@ FRAMES=124 bash examples/minimax_h3/model_training/musa/stage2_fsdp_8gpu.sh
 # 备选：8 卡 DeepSpeed ZeRO-3（56 帧稳态 5.44 s/it；124 帧稳态 14.75 s/it）
 bash examples/minimax_h3/model_training/musa/stage2_zero3_56f_t2va.sh
 bash examples/minimax_h3/model_training/musa/stage2_zero3_124f_fl2va.sh
+```
+
+### 2.3 阶段二：8 卡 33B 全参数微调（Full-Parameter SFT，`--trainable_models "dit"`）
+
+```bash
+# ★ 推荐首选：8 卡 FSDP 纯显存内全参 SFT（无需 CPU optimizer offload，产出 62 GiB / 535 张量完整 ckpt）
+FRAMES=56  bash examples/minimax_h3/model_training/musa/stage2_full_fsdp_8gpu.sh   # 稳态 9.21 s/it，保存 58.4 s
+FRAMES=124 bash examples/minimax_h3/model_training/musa/stage2_full_fsdp_8gpu.sh   # 稳态 17.85 s/it，保存 58.6 s
+
+# 备选：8 卡 DeepSpeed ZeRO-3 全参 SFT（56 帧显存内 11.04 s/it；124 帧自动启用 CPU optimizer offload 51.43 s/it）
+FRAMES=56  bash examples/minimax_h3/model_training/musa/stage2_full_zero3_8gpu.sh
+FRAMES=124 bash examples/minimax_h3/model_training/musa/stage2_full_zero3_8gpu.sh
 ```
 
 ---
@@ -155,3 +170,18 @@ bash examples/minimax_h3/model_training/musa/stage2_zero3_124f_fl2va.sh
 | **124 帧 FL2VA** | **第二轮 ZeRO-3（+ 新算子 + `int=7`，`stage2_zero3_124f_fl2va.sh`）** | **19.77 s** | **14.75 s/it (−21.3%)** | **14.55 s** | **15.59 s/it** | 23.9 s | 48.3 GiB |
 | **124 帧 FL2VA** | 第一轮 FSDP（bf16 混装 FlatParam + prefetch + `int=5`） | 30.11 s | 16.04 s/it | 15.96 s | 18.38 s/it | 1.8 s | 75.7 GiB |
 | **124 帧 FL2VA** | **★ 第二轮 FSDP（+ LoRA 分离消 65GB RS + 新算子 + `int=4`，`FRAMES=124 stage2_fsdp_8gpu.sh`）** | **24.41 s** | **11.74 s/it (−37.4%，1.60×）** | **11.72 s** | **13.85 s/it** | **1.3 s (15.7×)** | 70.4 GiB |
+
+### 5.3 8 卡 33B 全参数微调（Full-Parameter SFT，535 张量 / 62 GiB）实测对比
+
+| 基准负载 | 训练方案 | 首步耗时 | 稳态步时（第 2~4 步均） | 最快单步 | 保存 62 GiB ckpt | 峰值显存 | 说明 |
+|---|---|---|---|---|---|---|---|
+| **56 帧 T2VA** | 8 卡 ZeRO-3（无 CPU Offload，`int=1`） | 18.61 s | 11.04 s/it | 11.00 s | 61.8 s | 70.8 GiB | fp32 主权重 + m/v 占 ~58.7 GiB/卡 |
+| **56 帧 T2VA** | 8 卡 FSDP（`bf16` 分片 + `FusedAdamW`，`int=1`） | 30.50 s | 9.59 s/it | 9.58 s | 61.2 s | 39.3 GiB | 静态仅 ~32.6 GiB/卡，空余 >40 GiB 显存 |
+| **56 帧 T2VA** | **★ 8 卡 FSDP（`bf16` 分片 + `int=2`，`FRAMES=56 stage2_full_fsdp_8gpu.sh`）** | **29.71 s** | **9.21 s/it** | **9.16 s** | **58.4 s** | 75.7 GiB | 25/50 层免重算，**比 ZeRO-3 快 16.6%** |
+| **124 帧 FL2VA** | 8 卡 ZeRO-3（无 CPU Offload，`int=1`） | — | ❌ OOM | — | — | >79.9 GiB | 58.7 GiB 静态 + ~25 GiB 激活超 80 GB |
+| **124 帧 FL2VA** | 8 卡 ZeRO-3（开启 `offload_optimizer_device: cpu`，`int=1`） | 68.71 s | 51.43 s/it | 50.04 s | 61.8 s | 25.3 GiB | 受限于 PCIe D2H/H2D 优化器更新 |
+| **124 帧 FL2VA** | 8 卡 FSDP（`bf16` 分片 + `FusedAdamW`，`int=1`，**免 CPU Offload**） | 32.60 s | 18.31 s/it | 18.28 s | 55.4 s | 43.6 GiB | **纯显存内跑通 124 帧全参 SFT** |
+| **124 帧 FL2VA** | **★ 8 卡 FSDP（`bf16` 分片 + `int=7`，`FRAMES=124 stage2_full_fsdp_8gpu.sh`）** | **33.71 s** | **17.85 s/it** | **17.81 s** | **58.6 s** | 71.8 GiB | 8/50 层免重算，**比 ZeRO-3 CPU Offload 快 2.88×** |
+
+> **全参 SFT 训推闭环校验**：8 卡 FSDP 124 帧全参 SFT 产出的 `epoch-0.safetensors`（`62 GiB`）包含 `535` 个 `bfloat16` 张量，与原始 13 分片 `FL2VA/transformer/model*.safetensors` 的键名集合 **100% 匹配（535/535）**；直接通过 8 卡 TP 加载该 62 GiB 全参 checkpoint 推理生成 124 帧 / 50 步音视频（`tp8_full_sft_124f.mp4`），`load_s = 53.4 s`、`infer_s = 49.3 s`，经 `probe_av.py` 校验视频与立体声音轨完全正常。
+
