@@ -168,6 +168,21 @@ class ModelLogger:
                     full_tensor = torch.cat(pieces, dim=0)[: shape.numel()].view(shape).cpu()
                     state_dict[f"{prefix}{fqn}"] = full_tensor
                 del padded, gathered
+
+        # Also include any replicated trainable parameters excluded from FSDP sharding via ignored_states.
+        sharded_param_ids = {
+            id(p)
+            for fsdp_mod in FSDP.fsdp_modules(model)
+            if getattr(fsdp_mod, "_has_params", False) and hasattr(fsdp_mod._handle.flat_param, "_params")
+            for p in fsdp_mod._handle.flat_param._params
+        }
+        if accelerator.is_main_process:
+            for name, param in model.named_parameters():
+                if not param.requires_grad or id(param) in sharded_param_ids:
+                    continue
+                clean_name = name.replace("_fsdp_wrapped_module.", "").replace("_fsdp_wrapped_module", "").strip(".")
+                target_dtype = save_dtype if param.is_floating_point() and save_dtype is not None else param.dtype
+                state_dict[clean_name] = param.detach().to(dtype=target_dtype).cpu()
         return state_dict
 
     def save_model(self, accelerator: Accelerator, model: torch.nn.Module, file_name):

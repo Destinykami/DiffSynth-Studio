@@ -50,6 +50,16 @@ _HAS_ATEN_FUSED_SWIGLU = (
 )
 _HAS_TORCH_ROPE = callable(getattr(torch, "rope", None))
 
+try:
+    import triton
+    import triton.language as tl
+
+    _HAS_TRITON = True
+except Exception:
+    triton = None
+    tl = None
+    _HAS_TRITON = False
+
 
 class _FusedSwiGLUFunction(torch.autograd.Function):
     @staticmethod
@@ -111,12 +121,164 @@ def _apply_rope(x: torch.Tensor, freqs) -> torch.Tensor:
     return torch.cat((x_rot, x_pass), dim=-1)
 
 
+if _HAS_TRITON:
+
+    @triton.jit
+    def _adaln_scale_shift_fwd_kernel(
+        x_ptr, sh_ptr, sc_ptr, idx_ptr, out_ptr, sh_row_stride, sc_row_stride, HID, BLOCK_H: tl.constexpr
+    ):
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = cols < HID
+        m_idx = tl.load(idx_ptr + row)
+        x = tl.load(x_ptr + row * HID + cols, mask=mask).to(tl.float32)
+        sh = tl.load(sh_ptr + m_idx * sh_row_stride + cols, mask=mask).to(tl.float32)
+        sc = tl.load(sc_ptr + m_idx * sc_row_stride + cols, mask=mask).to(tl.float32)
+        y = x * (1.0 + sc) + sh
+        tl.store(out_ptr + row * HID + cols, y.to(x_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _adaln_scale_shift_bwd_dx_kernel(dy_ptr, sc_ptr, idx_ptr, dx_ptr, sc_row_stride, HID, BLOCK_H: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = cols < HID
+        m_idx = tl.load(idx_ptr + row)
+        dy = tl.load(dy_ptr + row * HID + cols, mask=mask).to(tl.float32)
+        sc = tl.load(sc_ptr + m_idx * sc_row_stride + cols, mask=mask).to(tl.float32)
+        dx = dy * (1.0 + sc)
+        tl.store(dx_ptr + row * HID + cols, dx.to(dy_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _adaln_gate_fwd_kernel(x_ptr, gt_ptr, ot_ptr, idx_ptr, out_ptr, gt_row_stride, HID, BLOCK_H: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = cols < HID
+        m_idx = tl.load(idx_ptr + row)
+        x = tl.load(x_ptr + row * HID + cols, mask=mask).to(tl.float32)
+        gt = tl.load(gt_ptr + m_idx * gt_row_stride + cols, mask=mask).to(tl.float32)
+        ot = tl.load(ot_ptr + row * HID + cols, mask=mask).to(tl.float32)
+        y = x + gt * ot
+        tl.store(out_ptr + row * HID + cols, y.to(x_ptr.dtype.element_ty), mask=mask)
+
+    @triton.jit
+    def _adaln_gate_bwd_dother_kernel(dy_ptr, gt_ptr, idx_ptr, dot_ptr, gt_row_stride, HID, BLOCK_H: tl.constexpr):
+        row = tl.program_id(0)
+        cols = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
+        mask = cols < HID
+        m_idx = tl.load(idx_ptr + row)
+        dy = tl.load(dy_ptr + row * HID + cols, mask=mask).to(tl.float32)
+        gt = tl.load(gt_ptr + m_idx * gt_row_stride + cols, mask=mask).to(tl.float32)
+        tl.store(dot_ptr + row * HID + cols, (dy * gt).to(dy_ptr.dtype.element_ty), mask=mask)
+
+
+class _FusedAdaLNScaleShiftFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        x_c = x if x.is_contiguous() else x.contiguous()
+        idx_c = indices if indices.is_contiguous() else indices.contiguous()
+        s_len, hid = x_c.shape
+        out = torch.empty_like(x_c)
+        block_h = 1024
+        _adaln_scale_shift_fwd_kernel[(s_len, triton.cdiv(hid, block_h))](
+            x_c, shift, scale, idx_c, out, shift.stride(0), scale.stride(0), hid, BLOCK_H=block_h
+        )
+        needs_param_grad = shift.requires_grad or scale.requires_grad
+        ctx.needs_param_grad = needs_param_grad
+        if needs_param_grad:
+            ctx.save_for_backward(scale, idx_c, x_c)
+            ctx.num_mod = shift.shape[0]
+        else:
+            ctx.save_for_backward(scale, idx_c)
+        return out
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        saved = ctx.saved_tensors
+        scale, idx_c = saved[0], saved[1]
+        dy_c = dy if dy.is_contiguous() else dy.contiguous()
+        s_len, hid = dy_c.shape
+        dx = torch.empty_like(dy_c)
+        block_h = 1024
+        _adaln_scale_shift_bwd_dx_kernel[(s_len, triton.cdiv(hid, block_h))](
+            dy_c, scale, idx_c, dx, scale.stride(0), hid, BLOCK_H=block_h
+        )
+        dshift = dscale = None
+        if ctx.needs_param_grad:
+            x_c = saved[2]
+            dy_f = dy_c.float()
+            dshift_f = torch.zeros((ctx.num_mod, hid), device=dy_c.device, dtype=torch.float32)
+            dscale_f = torch.zeros((ctx.num_mod, hid), device=dy_c.device, dtype=torch.float32)
+            dshift_f.index_add_(0, idx_c, dy_f)
+            dscale_f.index_add_(0, idx_c, dy_f * x_c.float())
+            dshift = dshift_f.to(scale.dtype)
+            dscale = dscale_f.to(scale.dtype)
+        return dx, dshift, dscale, None
+
+
+class _FusedAdaLNGateFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, gate: torch.Tensor, other: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        x_c = x if x.is_contiguous() else x.contiguous()
+        other_c = other if other.is_contiguous() else other.contiguous()
+        idx_c = indices if indices.is_contiguous() else indices.contiguous()
+        s_len, hid = x_c.shape
+        out = torch.empty_like(x_c)
+        block_h = 1024
+        _adaln_gate_fwd_kernel[(s_len, triton.cdiv(hid, block_h))](
+            x_c, gate, other_c, idx_c, out, gate.stride(0), hid, BLOCK_H=block_h
+        )
+        needs_param_grad = gate.requires_grad
+        ctx.needs_param_grad = needs_param_grad
+        if needs_param_grad:
+            ctx.save_for_backward(gate, idx_c, other_c)
+            ctx.num_mod = gate.shape[0]
+        else:
+            ctx.save_for_backward(gate, idx_c)
+        return out
+
+    @staticmethod
+    def backward(ctx, dy: torch.Tensor):
+        saved = ctx.saved_tensors
+        gate, idx_c = saved[0], saved[1]
+        dy_c = dy if dy.is_contiguous() else dy.contiguous()
+        s_len, hid = dy_c.shape
+        dother = torch.empty_like(dy_c)
+        block_h = 1024
+        _adaln_gate_bwd_dother_kernel[(s_len, triton.cdiv(hid, block_h))](
+            dy_c, gate, idx_c, dother, gate.stride(0), hid, BLOCK_H=block_h
+        )
+        dgate = None
+        if ctx.needs_param_grad:
+            other_c = saved[2]
+            dgate_f = torch.zeros((ctx.num_mod, hid), device=dy_c.device, dtype=torch.float32)
+            dgate_f.index_add_(0, idx_c, dy_c.float() * other_c.float())
+            dgate = dgate_f.to(gate.dtype)
+        return dy_c, dgate, dother, None
+
+
 def _modulate_scale_shift(x, shift, scale, indices):
+    if (
+        _HAS_TRITON
+        and x.device.type != "cpu"
+        and x.dim() == 2
+        and shift.stride(-1) == 1
+        and scale.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        return _FusedAdaLNScaleShiftFunction.apply(x, shift, scale, indices)
     # Cast back to x: index_select on the AdaLN params can promote the expression.
     return (x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)).to(x.dtype)
 
 
 def _modulate_gate(x, gate, other, indices):
+    if (
+        _HAS_TRITON
+        and x.device.type != "cpu"
+        and x.dim() == 2
+        and gate.stride(-1) == 1
+        and not torch.compiler.is_compiling()
+    ):
+        return _FusedAdaLNGateFunction.apply(x, gate, other, indices)
     return (x + gate.index_select(0, indices) * other).to(x.dtype)
 
 
@@ -221,9 +383,7 @@ class MiniMaxH3Attention(nn.Module):
         total = x.shape[0]
         qkv = self.qkv_proj(x)
         qkv = qkv.view(total, self.num_heads, 3, self.head_dim)
-        q = qkv[:, :, 0, :]
-        k = qkv[:, :, 1, :]
-        v = qkv[:, :, 2, :]
+        q, k, v = qkv.permute(2, 0, 1, 3).contiguous().unbind(0)
         q = self.q_norm(q)
         k = self.k_norm(k)
         if rope_freqs is not None:
@@ -465,12 +625,16 @@ class MiniMaxH3DiT(nn.Module):
         cu_arg = packed_seq_params["cu_seqlens_q"].to(device=device, dtype=torch.int32) if getattr(self, "vdn_enabled", False) else cu_seqlens_bounds
         ckpt_interval = int(gradient_checkpointing_interval) if gradient_checkpointing_interval is not None else 1
         for block_id, block in enumerate(self.blocks):
-            if not use_gradient_checkpointing or ckpt_interval <= 0:
+            if not use_gradient_checkpointing or ckpt_interval == 0:
                 ckpt_block = False
             elif ckpt_interval == 1:
                 ckpt_block = True
-            else:
+            elif ckpt_interval > 1:
+                # Positive k: skip checkpointing every k-th block (keeping 1/k of blocks in VRAM).
                 ckpt_block = (block_id % ckpt_interval) != 0
+            else:
+                # Negative -k (k >= 2): only checkpoint every k-th block (keeping (k-1)/k of blocks in VRAM).
+                ckpt_block = (block_id % (-ckpt_interval)) == 0
             hidden = gradient_checkpoint_forward(
                 block,
                 ckpt_block,
