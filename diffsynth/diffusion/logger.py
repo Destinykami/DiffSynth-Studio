@@ -20,17 +20,72 @@ class TensorBoardLogger:
 
 class SwanLabLogger:
     def __init__(self, project_name="DiffSynth-Studio", log_dir=None):
-        import swanlab
-        project_name = os.environ.get("SWANLAB_PROJECT", project_name)
-        self.swanlab = swanlab
-        self.swanlab.init(project=project_name, logdir=log_dir)
-        print(f"SwanLab is enabled. Project: {project_name}")
+        self.enabled = False
+        self.swanlab = None
+        try:
+            import swanlab
+
+            self.swanlab = swanlab
+        except Exception as exc:
+            print(f"[SwanLabLogger] swanlab package is not available ({exc}); skipping SwanLab logging.")
+            return
+
+        project_name = os.environ.pop("SWANLAB_PROJECT", None) or os.environ.get("SWANLAB_PROJECT_NAME", project_name)
+        run_name = os.environ.pop("SWANLAB_RUN_NAME", None) or os.environ.get("SWANLAB_EXPERIMENT_NAME", None)
+        mode = os.environ.get("SWANLAB_MODE", None)
+        api_key = os.environ.get("SWANLAB_API_KEY", None)
+
+        try:
+            if api_key:
+                try:
+                    self.swanlab.login(api_key=api_key, save=False)
+                except Exception as login_exc:
+                    print(f"[SwanLabLogger] API key login failed ({login_exc}); falling back to offline/local mode.")
+                    if mode is None:
+                        mode = "offline"
+            init_kwargs = {"project": project_name, "logdir": log_dir}
+            if run_name:
+                init_kwargs["name"] = run_name
+            if mode:
+                init_kwargs["mode"] = mode
+            try:
+                self.swanlab.init(**init_kwargs)
+            except Exception as init_exc:
+                if mode not in ("offline", "local", "disabled"):
+                    print(f"[SwanLabLogger] Online init failed ({init_exc}); falling back to mode='offline'.")
+                    init_kwargs["mode"] = "offline"
+                    self.swanlab.init(**init_kwargs)
+                else:
+                    raise
+            self.enabled = True
+            print(f"SwanLab is enabled. Project: {project_name} (mode={init_kwargs.get('mode', 'online')})")
+        except Exception as exc:
+            print(f"[SwanLabLogger] Could not initialize SwanLab ({exc}); continuing training without SwanLab.")
+            self.enabled = False
 
     def log(self, key, value, step):
-        self.swanlab.log({key: value}, step=step)
+        if not self.enabled or self.swanlab is None:
+            return
+        try:
+            if isinstance(value, torch.Tensor):
+                value = value.detach().float().mean().item()
+            if isinstance(key, dict):
+                self.swanlab.log(key, step=step)
+            else:
+                self.swanlab.log({key: value}, step=step)
+        except Exception as exc:
+            print(f"[SwanLabLogger] Warning: failed to log step {step} ({exc}); disabling SwanLab for remaining steps.")
+            self.enabled = False
 
     def close(self):
-        self.swanlab.finish()
+        if not self.enabled or self.swanlab is None:
+            return
+        try:
+            self.swanlab.finish()
+        except Exception as exc:
+            print(f"[SwanLabLogger] Warning: error during swanlab.finish() ({exc}).")
+        finally:
+            self.enabled = False
 
 
 class WandbLogger:
@@ -105,13 +160,18 @@ class ModelLogger:
 
     def on_step_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None, **kwargs):
         self.num_steps += 1
+        need_init = not self.loggers_initialized
         if accelerator.is_main_process:
-            if not self.loggers_initialized:
+            if need_init:
                 self.init_loggers()
             loss = kwargs.get("loss")
             if loss is not None:
                 for logger in self.loggers:
                     logger.log("loss", loss, self.num_steps)
+        else:
+            self.loggers_initialized = True
+        if need_init and (self.enable_swanlab_log or self.enable_wandb_log):
+            accelerator.wait_for_everyone()
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
 
@@ -121,9 +181,12 @@ class ModelLogger:
     def on_training_end(self, accelerator: Accelerator, model: torch.nn.Module, save_steps=None):
         if save_steps is not None and self.num_steps % save_steps != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+        accelerator.wait_for_everyone()
+        if dist.is_available() and dist.is_initialized():
+            torch.cuda.synchronize()
+            dist.destroy_process_group()
         for logger in self.loggers:
             logger.close()
-        accelerator.wait_for_everyone()
 
     @staticmethod
     def _gather_fsdp_trainable_state_dict(accelerator: Accelerator, model: torch.nn.Module, save_dtype=torch.bfloat16):

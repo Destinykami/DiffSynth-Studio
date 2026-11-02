@@ -41,6 +41,12 @@ else
   CFG_FILE="${SCRIPT_DIR}/accelerate_config_zero3_8gpu.yaml"
 fi
 
+SWANLAB_ARGS=()
+if [ "${ENABLE_SWANLAB:-0}" = "1" ] || [ -n "${SWANLAB_API_KEY:-}" ]; then
+  SWANLAB_ARGS=(--enable_swanlab_log --swanlab_project "${SWANLAB_PROJECT_NAME:-${SWANLAB_PROJECT:-MiniMax-H3-MUSA}}")
+  unset SWANLAB_PROJECT
+fi
+
 accelerate launch --config_file "${CFG_FILE}" \
   "${SCRIPT_DIR}/train_musa.py" \
   --dataset_base_path "${CACHE_PATH}" \
@@ -58,4 +64,5 @@ accelerate launch --config_file "${CFG_FILE}" \
   --trainable_models "dit" \
   --use_gradient_checkpointing \
   --gradient_checkpointing_interval "${CKPT_INTERVAL}" \
+  "${SWANLAB_ARGS[@]}" \
   --task "sft:train"

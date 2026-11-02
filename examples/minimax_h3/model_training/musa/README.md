@@ -83,6 +83,32 @@ FRAMES=56  bash examples/minimax_h3/model_training/musa/stage2_full_zero3_8gpu.s
 FRAMES=124 bash examples/minimax_h3/model_training/musa/stage2_full_zero3_8gpu.sh
 ```
 
+### 2.4 可选：开启 SwanLab 可视化看板（支持在线同步与无密钥/离线自动降级）
+
+所有阶段二训练脚本与 `run_stability_test.sh` 均内置了**可选的 SwanLab 可视化支持**（默认不开启，不影响任何原有脚本行为；即使开启但未配置 API Key 或外网不通，也会自动降级为 `offline` 本地落盘模式，**绝不中断训练**）：
+
+```bash
+# 方式 1：已通过 `swanlab login` 保存过凭证时，只需设 ENABLE_SWANLAB=1
+ENABLE_SWANLAB=1 SWANLAB_RUN_NAME="fsdp-56f-run1" \
+  FRAMES=56 bash examples/minimax_h3/model_training/musa/stage2_fsdp_8gpu.sh
+
+# 方式 2：直接通过环境变量传入 SWANLAB_API_KEY（无需预先 login）
+SWANLAB_API_KEY="<YOUR_SWANLAB_API_KEY>" \
+  SWANLAB_PROJECT_NAME="MiniMax-H3-MUSA" \
+  SWANLAB_RUN_NAME="stability-56f" \
+  FRAMES=56 DATASET_REPEAT=50 TRAIN_EVAL_EVERY=10 \
+  bash examples/minimax_h3/model_training/musa/run_stability_test.sh
+
+# 方式 3：无外网 / 无 API Key 环境下仅记录本地 SwanLab 日志（事后可 `swanlab sync`）
+ENABLE_SWANLAB=1 SWANLAB_MODE=offline \
+  FRAMES=56 bash examples/minimax_h3/model_training/musa/stage2_fsdp_8gpu.sh
+```
+
+开启后会自动向 SwanLab 上报以下指标曲线：
+- `loss`（每步原始训练 Loss）、`train/ema_loss`（平滑 Loss）、`train/grad_norm`（LoRA 梯度二范数）；
+- `train/step_time_s`（单步耗时）、`train/alloc_gib` / `train/resv_gib`（显存监控）；
+- `eval/fixed_anchor_mean_loss` 及 `eval/fixed_anchor_t200` / `t500` / `t800`（当启用 `TRAIN_EVAL_EVERY` 时）。
+
 ---
 
 ## 3. 核心优化点详解（全部验证无损 bf16 精度）

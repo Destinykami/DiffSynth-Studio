@@ -371,6 +371,7 @@ def install_lifecycle_and_telemetry() -> None:
     prev_step_end_holder = [None]
 
     def on_step_end(self, accelerator, model, save_steps=None, **kwargs):
+        cur_step = None
         if profile_enabled:
             torch.cuda.synchronize()
             now = time.perf_counter()
@@ -391,9 +392,29 @@ def install_lifecycle_and_telemetry() -> None:
             cur_step = len(step_timestamps)
             if eval_every > 0 and (cur_step == 1 or cur_step % eval_every == 0):
                 run_fixed_anchor_eval(accelerator, model, cur_step)
+        ret = orig_on_step_end(self, accelerator, model, save_steps=save_steps, **kwargs)
+        if profile_enabled and cur_step is not None and accelerator.is_main_process:
+            extra_metrics = {
+                "train/step_time_s": step_timestamps[-1],
+                "train/alloc_gib": step_alloc_gbs[-1],
+                "train/resv_gib": step_resv_gbs[-1],
+            }
+            if step_ema_losses:
+                extra_metrics["train/ema_loss"] = step_ema_losses[-1]
+            if step_grad_norms and step_grad_norms[-1] > 0:
+                extra_metrics["train/grad_norm"] = step_grad_norms[-1]
+            if eval_history and eval_history[-1][0] == cur_step:
+                _, mean_eval, per_t = eval_history[-1]
+                extra_metrics["eval/fixed_anchor_mean_loss"] = mean_eval
+                for t_k, t_v in per_t.items():
+                    extra_metrics[f"eval/fixed_anchor_t{t_k}"] = t_v
+            for lg in getattr(self, "loggers", []):
+                if type(lg).__name__ == "SwanLabLogger":
+                    lg.log(extra_metrics, None, self.num_steps)
+        if profile_enabled:
             torch.cuda.synchronize()
             prev_step_end_holder[0] = time.perf_counter()
-        return orig_on_step_end(self, accelerator, model, save_steps=save_steps, **kwargs)
+        return ret
 
     def save_model(self, accelerator, model, file_name):
         if self.remove_prefix_in_ckpt is None:
