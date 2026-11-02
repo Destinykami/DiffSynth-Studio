@@ -114,6 +114,7 @@ def launch_training_task(
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
     model_logger.on_training_end(accelerator, model, save_steps)
+    accelerator.end_training()
 
 
 def launch_data_process_task(
@@ -151,6 +152,7 @@ def launch_data_process_task(
                 torch.save(data, save_path)
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
+    accelerator.end_training()
 
 def initialize_deepspeed_gradient_checkpointing(accelerator: Accelerator):
     if getattr(accelerator.state, "deepspeed_plugin", None) is not None:

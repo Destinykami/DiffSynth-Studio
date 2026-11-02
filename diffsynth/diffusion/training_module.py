@@ -87,7 +87,9 @@ class DiffusionTrainingModule(torch.nn.Module):
     
     def trainable_param_names(self):
         trainable_param_names = list(filter(lambda named_param: named_param[1].requires_grad, self.named_parameters()))
-        trainable_param_names = set([named_param[0] for named_param in trainable_param_names])
+        trainable_param_names = set(
+            [named_param[0].replace("_fsdp_wrapped_module.", "") for named_param in trainable_param_names]
+        )
         return trainable_param_names
     
     
