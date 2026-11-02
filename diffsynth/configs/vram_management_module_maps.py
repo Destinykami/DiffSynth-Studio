@@ -30,6 +30,7 @@ VRAM_MANAGEMENT_MODULE_MAPS = {
         "diffsynth.models.minimax_h3_dit_vdn.MiniMaxH3VDNAlpha": "diffsynth.core.vram.layers.AutoWrappedModule",
     },
     "diffsynth.models.minimax_h3_text_encoder.MiniMaxH3TextEncoder": {
+        "transformers.models.qwen3_vl.modeling_qwen3_vl.Qwen3VLVisionModel": "diffsynth.core.vram.layers.AutoWrappedModule",
         "torch.nn.Linear": "diffsynth.core.vram.layers.AutoWrappedLinear",
         "torch.nn.Embedding": "diffsynth.core.vram.layers.AutoWrappedModule",
         "torch.nn.LayerNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
