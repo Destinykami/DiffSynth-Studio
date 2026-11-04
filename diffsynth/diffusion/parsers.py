@@ -63,6 +63,7 @@ def add_lora_config(parser: argparse.ArgumentParser):
 def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
+    parser.add_argument("--gradient_checkpointing_interval", type=int, default=1, help="Selective activation checkpointing interval across DiT blocks: 1 checkpoints every block (default), k>1 skips checkpointing every k-th block (keeping 1/k of blocks in VRAM), -k (k>=2) only checkpoints every k-th block (keeping (k-1)/k of blocks in VRAM), and 0 disables checkpointing.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
     return parser
 

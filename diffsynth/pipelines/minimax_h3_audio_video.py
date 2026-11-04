@@ -980,6 +980,7 @@ def model_fn_minimax_h3(
     control_scale=1.0,
     use_gradient_checkpointing=False,
     use_gradient_checkpointing_offload=False,
+    gradient_checkpointing_interval=1,
     **kwargs,
 ):
     t_video = 1.0 - float(timestep_video) / 1000
@@ -1083,6 +1084,7 @@ def model_fn_minimax_h3(
         skip_mask_out_condition=True,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        gradient_checkpointing_interval=gradient_checkpointing_interval,
         control_hints=control_hints,
     )
 
