@@ -65,6 +65,37 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6
 
 使用 Ascend NPU 时，请将 Python 代码中的 `"cuda"` 改为 `"npu"`，详见[NPU 支持](../Pipeline_Usage/GPU_support.md#ascend-npu)。
 
+### Moore Threads MUSA GPU
+
+在摩尔线程（Moore Threads）MUSA GPU 环境下（基于预装 `torch` 与 `torch_musa` 2.7.x 的官方 `training-suite:v2.1.7` 镜像），请按以下步骤完成依赖配置：
+
+1. 安装系统 FFmpeg 共享库（启用 `torchaudio` 的原生 FFmpeg 音视频解码后端，用于从 `.mp4` 训练视频中直接读取音轨；先使用 `dpkg-divert` 避开 `mthreads` 容器运行时只读挂载的宿主机驱动文件冲突）：
+   ```shell
+   mount | awk '$3 ~ "^/usr/lib/x86_64-linux-gnu/" {print $3}' | xargs -r -I{} dpkg-divert --local --no-rename --divert {}.pkg {}
+   apt-get update && apt-get install -y --no-install-recommends \
+       libavutil56 libavcodec58 libavformat58 libavfilter7 libavdevice58
+   ```
+
+2. 安装 `torchada` 适配层与 `DiffSynth-Studio`（会自动约束适配 `torch 2.7` 的 `peft>=0.18.1,<0.19.0` 与原生支持 `mccl` 的 `accelerate>=1.12.0`）：
+   ```shell
+   git clone https://github.com/modelscope/DiffSynth-Studio.git
+   cd DiffSynth-Studio
+   pip install torchada "torchcodec==0.5" --index-url https://pypi.org/simple
+   pip install -e . --index-url https://pypi.org/simple
+   ```
+
+3. 安装或升级 MUSA `FlashAttention-3` 与 `MATE` 算子库（需 `>=0.2.8.post1`）：
+   ```shell
+   # 安装 MATE（含 TileLang 反向后处理依赖）与可选 MATE-MUBIN
+   pip install -U "mate[all]" --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple --extra-index-url https://pypi.org/simple
+   pip install -U mate-mubin --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+
+   # 安装 FlashAttention-3 接口包
+   pip install -U flash_attn_3 --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   ```
+
+使用 MUSA GPU 运行推理与分布式训练（FSDP / DeepSpeed ZeRO-3）的详细启动方式，请参见 [MUSA GPU 支持](../Pipeline_Usage/GPU_support.md#moore-threads-musa-gpu)。
+
 ## 其他安装问题
 
 如果在安装过程中遇到问题，可能是由上游依赖包导致的，请参考这些包的文档：

@@ -543,7 +543,13 @@ def launch_dmd2_training_task(
         optimizers["discriminator_scheduler"] = discriminator_scheduler
         prepare_items.extend([discriminator_optimizer, discriminator_scheduler])
 
-    dataloader = torch.utils.data.DataLoader(dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=num_workers)
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        shuffle=True,
+        collate_fn=lambda x: x[0],
+        num_workers=num_workers,
+        generator=torch.Generator(device="cpu"),
+    )
     prepare_items.append(dataloader)
 
     if enable_model_cpu_offload:

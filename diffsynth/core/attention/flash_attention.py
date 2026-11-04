@@ -24,7 +24,11 @@ try:
     from flash_attn_3 import flash_attn_interface
     FLASH_ATTN_3_AVAILABLE = True
 except Exception:
-    FLASH_ATTN_3_AVAILABLE = False
+    try:
+        import flash_attn_interface
+        FLASH_ATTN_3_AVAILABLE = True
+    except Exception:
+        FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn

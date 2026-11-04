@@ -131,3 +131,4 @@ class ModelLogger:
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+        accelerator.wait_for_everyone()
