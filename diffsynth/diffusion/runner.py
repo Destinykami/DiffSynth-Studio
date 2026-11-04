@@ -1,6 +1,8 @@
 import os, json, torch, importlib
 from tqdm import tqdm
 from accelerate import Accelerator
+from accelerate.utils import DistributedType
+import torch.distributed as dist
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 from diffsynth.core import OffloadTrainingManager
@@ -48,6 +50,80 @@ def exclude_quantized_params_from_ddp_sync(accelerator: Accelerator, model: Diff
                 print(f"{len(ignored)} quantized weights are excluded from DDP state synchronization.")
     except Exception as e:
         print(f"Warning: failed to exclude quantized weights from DDP state synchronization: {e}")
+
+
+def prepare_fsdp_lora_separation(accelerator: Accelerator, model: DiffusionTrainingModule):
+    """Under FSDP1 with mixed_precision=bf16 and LoRA fine-tuning:
+    1. Exclude LoRA adapter submodules (lora_A / lora_B) from FSDP FlatParameters via ignored_modules
+       so the frozen base FlatParameters have requires_grad=False (skipping 65 GB/step of redundant
+       unsharded grad allocation and reduce_scatter).
+    2. Keep replicated LoRA parameters in fp32 for master-weight precision and synchronize their
+       gradients via a single bucketed all_reduce after backward.
+    """
+    if accelerator.distributed_type != DistributedType.FSDP or getattr(accelerator, "is_fsdp2", False):
+        return False
+    if os.environ.get("DIFFSYNTH_FSDP_SEPARATE_LORA", "1") != "1":
+        return False
+    fsdp_plugin = getattr(accelerator.state, "fsdp_plugin", None)
+    if fsdp_plugin is None:
+        return False
+    if getattr(fsdp_plugin, "limit_all_gathers", None) is False:
+        fsdp_plugin.limit_all_gathers = True
+
+    lora_modules = [
+        mod for name, mod in model.named_modules()
+        if name.endswith(".lora_A") or name.endswith(".lora_B")
+    ]
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    non_lora_trainable = [
+        name for name, p in model.named_parameters()
+        if p.requires_grad and (".lora_A." not in name and ".lora_B." not in name)
+    ]
+    if not lora_modules or not trainable_params or non_lora_trainable:
+        return False
+
+    with torch.no_grad():
+        for p in trainable_params:
+            if p.device.type == "cpu":
+                p.data = p.data.to(accelerator.device)
+            if p.dtype != torch.float32:
+                p.data = p.data.to(torch.float32)
+            if dist.is_initialized() and dist.get_world_size() > 1:
+                dist.broadcast(p.data, src=0)
+    fsdp_plugin.ignored_modules = lora_modules
+    accelerator._fsdp_replicated_lora_params = trainable_params
+    return True
+
+
+def preserve_fsdp_bf16_flat_params(accelerator: Accelerator, model: torch.nn.Module):
+    if accelerator.distributed_type != DistributedType.FSDP or getattr(accelerator, "is_fsdp2", False):
+        return
+    if os.environ.get("DIFFSYNTH_FSDP_KEEP_BF16", "1") != "1":
+        return
+    if accelerator.mixed_precision != "bf16":
+        return
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    for fsdp_mod in FSDP.fsdp_modules(model):
+        if not getattr(fsdp_mod, "_has_params", False):
+            continue
+        param = fsdp_mod._flat_param
+        if param.dtype == torch.float32 and not param.requires_grad:
+            param.data = param.data.to(torch.bfloat16)
+            fsdp_mod._handle._orig_param_dtype = torch.bfloat16
+
+
+def sync_fsdp_replicated_lora_grads(accelerator: Accelerator):
+    replicated_lora = getattr(accelerator, "_fsdp_replicated_lora_params", None)
+    if replicated_lora and accelerator.sync_gradients and dist.is_initialized() and dist.get_world_size() > 1:
+        grads = [p.grad for p in replicated_lora if p.grad is not None]
+        if grads:
+            flat_grad = torch.cat([g.reshape(-1) for g in grads])
+            dist.all_reduce(flat_grad, op=dist.ReduceOp.AVG)
+            offset = 0
+            for g in grads:
+                numel = g.numel()
+                g.copy_(flat_grad[offset : offset + numel].view_as(g))
+                offset += numel
 
 
 def launch_training_task(
@@ -99,7 +175,9 @@ def launch_training_task(
     else:
         model.to(device=accelerator.device)
         exclude_quantized_params_from_ddp_sync(accelerator, model)
+        prepare_fsdp_lora_separation(accelerator, model)
         model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+        preserve_fsdp_bf16_flat_params(accelerator, model)
 
     initialize_deepspeed_gradient_checkpointing(accelerator)
     for epoch_id in range(num_epochs):
@@ -110,6 +188,7 @@ def launch_training_task(
                 else:
                     loss = model(data)
                 accelerator.backward(loss)
+                sync_fsdp_replicated_lora_grads(accelerator)
                 if enable_model_cpu_offload:
                     offload_manager.after_backward()
                 optimizer.step()
