@@ -268,5 +268,5 @@ accelerate launch --config_file zero3_8gpu.yaml run_musa.py \
 | `tilelang-musa` | `0.1.12+musa.5` | 通过 `pip install "mate[all]"` 自动安装，提供 FA3 反向后处理内核 |
 | `accelerate` | `>=1.12.0` | 原生支持 `MULTI_MUSA` 与 `mccl` 后端 |
 | `peft` | `>=0.18.1,<0.19.0` | 兼容 `torch 2.7` / `torchao 0.9` 环境 |
-| `torchaudio` + FFmpeg 库 | `2.7.1` + `libav*58` | 原生支持从 `.mp4` 容器直接解码音轨 |
+| `torchaudio` + FFmpeg 库 | `2.7.1` + `libav*58` | 需同时安装 `libavutil56 libavcodec58 libavformat58 libavfilter7 libavdevice58` 以启用原生 FFmpeg 后端 |
 | `torchcodec` | `0.5` | 适配 `torch 2.7` 的 `diffsynth.utils.data.audio` 默认后端 |

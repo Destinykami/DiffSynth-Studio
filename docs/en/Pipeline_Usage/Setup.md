@@ -66,28 +66,27 @@ When using Ascend NPU, please replace `"cuda"` with `"npu"` in your Python code.
 
 ### Moore Threads MUSA GPU
 
-On Moore Threads MUSA GPUs (starting from the official container image pre-installed with `torch` and `torch_musa` 2.7.x), install the dependencies as follows:
+On Moore Threads MUSA GPUs (starting from the official `training-suite:v2.1.7` container image pre-installed with `torch` and `torch_musa` 2.7.x), install the dependencies as follows:
 
-1. Install system FFmpeg shared libraries (required by `torchaudio`'s native FFmpeg backend to decode audio tracks directly from `.mp4` videos):
+1. Install system FFmpeg shared libraries (required by `torchaudio`'s native FFmpeg backend to decode audio tracks directly from `.mp4` videos; divert read-only host-mounted MUSA driver libraries first so `dpkg` does not attempt to overwrite them):
    ```shell
+   mount | awk '$3 ~ "^/usr/lib/x86_64-linux-gnu/" {print $3}' | xargs -r -I{} dpkg-divert --local --no-rename --divert {}.pkg {}
    apt-get update && apt-get install -y --no-install-recommends \
-       libavutil56 libavcodec58 libavformat58 libavfilter7
+       libavutil56 libavcodec58 libavformat58 libavfilter7 libavdevice58
    ```
 
 2. Install the `torchada` adapter and `DiffSynth-Studio` (which automatically pins `peft>=0.18.1,<0.19.0` for `torch 2.7` compatibility and `accelerate>=1.12.0` for native `mccl` backend support):
    ```shell
-   pip install torchada
    git clone https://github.com/modelscope/DiffSynth-Studio.git
    cd DiffSynth-Studio
-   pip install -e .
-   # For audio-video models such as MiniMax-H3, install torchcodec 0.5 (compatible with PyTorch 2.7)
-   pip install "torchcodec==0.5" --index-url https://pypi.org/simple
+   pip install torchada "torchcodec==0.5" --index-url https://pypi.org/simple
+   pip install -e . --index-url https://pypi.org/simple
    ```
 
 3. Install or upgrade MUSA `FlashAttention-3` and `MATE` operator packages (`>=0.2.8.post1`):
    ```shell
    # Install MATE (with TileLang backward post-processing dependencies) and optional MATE-MUBIN
-   pip install -U "mate[all]" --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
+   pip install -U "mate[all]" --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple --extra-index-url https://pypi.org/simple
    pip install -U mate-mubin --index-url https://dl.mthreads.com/repo/api/pypi/pypi/simple
 
    # Install FlashAttention-3 interface

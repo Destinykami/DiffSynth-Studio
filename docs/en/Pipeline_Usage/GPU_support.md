@@ -269,5 +269,5 @@ accelerate launch --config_file zero3_8gpu.yaml run_musa.py \
 | `tilelang-musa` | `0.1.12+musa.5` | Installed via `pip install "mate[all]"` for FA3 backward post-processing |
 | `accelerate` | `>=1.12.0` | Native `MULTI_MUSA` and `mccl` backend support |
 | `peft` | `>=0.18.1,<0.19.0` | Compatible with `torch 2.7` / `torchao 0.9` |
-| `torchaudio` + FFmpeg libs | `2.7.1` + `libav*58` | Native FFmpeg audio decoding from `.mp4` containers |
+| `torchaudio` + FFmpeg libs | `2.7.1` + `libav*58` | Requires `libavutil56 libavcodec58 libavformat58 libavfilter7 libavdevice58` for native FFmpeg decoding |
 | `torchcodec` | `0.5` | Compatible with `torch 2.7` for `diffsynth.utils.data.audio` |
