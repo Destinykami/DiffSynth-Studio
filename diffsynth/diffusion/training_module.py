@@ -69,6 +69,114 @@ class GeneralUnit_TemplateForward(PipelineUnit):
         return template_cache
 
 
+class _FusedLoRALinearFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w_base, bias, lora_A, lora_B, scaling: float):
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        compute_dtype = x_2d.dtype
+        w_b = w_base if w_base.dtype == compute_dtype else w_base.to(compute_dtype)
+        l_a = lora_A if lora_A.dtype == compute_dtype else lora_A.to(compute_dtype)
+        l_b = lora_B if lora_B.dtype == compute_dtype else lora_B.to(compute_dtype)
+        if bias is not None:
+            b = bias if bias.dtype == compute_dtype else bias.to(compute_dtype)
+            out = torch.addmm(b, x_2d, w_b.t())
+        else:
+            out = torch.mm(x_2d, w_b.t())
+        xa = torch.mm(x_2d, l_a.t())
+        out.addmm_(xa, l_b.t(), beta=1.0, alpha=scaling)
+        ctx.save_for_backward(x_2d, w_base, lora_A, lora_B, xa)
+        ctx.scaling = scaling
+        ctx.orig_shape = orig_shape
+        ctx.needs_base_grad = w_base.requires_grad
+        ctx.needs_bias_grad = bias is not None and bias.requires_grad
+        ctx.bias_dtype = bias.dtype if bias is not None else None
+        return out.view(*orig_shape[:-1], out.shape[-1])
+
+    @staticmethod
+    def backward(ctx, dy):
+        x_2d, w_base, lora_A, lora_B, xa = ctx.saved_tensors
+        scaling = ctx.scaling
+        dy_2d = dy.reshape(-1, dy.shape[-1])
+        if not dy_2d.is_contiguous():
+            dy_2d = dy_2d.contiguous()
+        compute_dtype = dy_2d.dtype
+        w_b = w_base if w_base.dtype == compute_dtype else w_base.to(compute_dtype)
+        l_a = lora_A if lora_A.dtype == compute_dtype else lora_A.to(compute_dtype)
+        l_b = lora_B if lora_B.dtype == compute_dtype else lora_B.to(compute_dtype)
+
+        d_lora_B = torch.mm(dy_2d.t(), xa).mul_(scaling)
+        if d_lora_B.dtype != lora_B.dtype:
+            d_lora_B = d_lora_B.to(lora_B.dtype)
+
+        d_xa = torch.mm(dy_2d, l_b).mul_(scaling)
+        d_lora_A = torch.mm(d_xa.t(), x_2d)
+        if d_lora_A.dtype != lora_A.dtype:
+            d_lora_A = d_lora_A.to(lora_A.dtype)
+
+        dx_2d = None
+        if ctx.needs_input_grad[0]:
+            dx_2d = torch.mm(dy_2d, w_b)
+            dx_2d.addmm_(d_xa, l_a)
+            dx_2d = dx_2d.view(ctx.orig_shape)
+
+        dw_base = None
+        if ctx.needs_base_grad:
+            dw_base = torch.mm(dy_2d.t(), x_2d)
+            if dw_base.dtype != w_base.dtype:
+                dw_base = dw_base.to(w_base.dtype)
+
+        dbias = None
+        if ctx.needs_bias_grad:
+            dbias = dy_2d.sum(dim=0).to(ctx.bias_dtype)
+
+        return dx_2d, dw_base, dbias, d_lora_A, d_lora_B, None
+
+
+def _install_fused_peft_lora_linear(model: torch.nn.Module) -> int:
+    import types
+
+    try:
+        from peft.tuners.lora.layer import Linear as PeftLoraLinear
+    except Exception:
+        return 0
+
+    def _fast_lora_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+        if (
+            self.merged
+            or self.disable_adapters
+            or len(self.active_adapters) != 1
+            or args
+            or kwargs
+            or getattr(self, "use_dora", {}).get(self.active_adapters[0], False)
+            or not isinstance(self.base_layer, torch.nn.Linear)
+            or type(self.base_layer) is not torch.nn.Linear
+        ):
+            return PeftLoraLinear.forward(self, x, *args, **kwargs)
+        adapter = self.active_adapters[0]
+        if adapter not in self.lora_A or not isinstance(self.lora_dropout[adapter], torch.nn.Identity):
+            return PeftLoraLinear.forward(self, x, *args, **kwargs)
+        if getattr(self, "lora_magnitude_vector", None) and self.lora_magnitude_vector[adapter] is not None:
+            return PeftLoraLinear.forward(self, x, *args, **kwargs)
+        return _FusedLoRALinearFunction.apply(
+            x,
+            self.base_layer.weight,
+            self.base_layer.bias,
+            self.lora_A[adapter].weight,
+            self.lora_B[adapter].weight,
+            float(self.scaling[adapter]),
+        )
+
+    patched = 0
+    for mod in model.modules():
+        if type(mod) is PeftLoraLinear:
+            mod.forward = types.MethodType(_fast_lora_forward, mod)
+            patched += 1
+    return patched
+
+
 class DiffusionTrainingModule(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -105,6 +213,8 @@ class DiffusionTrainingModule(torch.nn.Module):
             for param in model.parameters():
                 if param.requires_grad:
                     param.data = param.to(upcast_dtype)
+        if os.environ.get("DIFFSYNTH_FUSED_LORA_LINEAR", "1") == "1":
+            _install_fused_peft_lora_linear(model)
         return model
 
 
